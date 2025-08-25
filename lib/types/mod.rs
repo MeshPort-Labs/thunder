@@ -534,6 +534,7 @@ struct CbmtNode {
     index: usize,
 }
 
+
 impl PartialOrd for CbmtNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -560,11 +561,11 @@ impl merkle_cbt::merkle_tree::Merge for MergeFeeSizeTotal {
         // see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
         assert_eq!(lnode.index + 1, rnode.index);
         let index = (lnode.index - 1) / 2;
-        let commitment = hashes::hash(&CbmtNodePreCommitment {
+        let commitment = hashes::hash_with_scratch_buffer(&CbmtNodePreCommitment {
             left_commitment: lnode.commitment,
             fees,
             canonical_size,
-            right_commitment: lnode.commitment,
+            right_commitment: rnode.commitment,
         });
         Self::Item {
             commitment,
@@ -657,8 +658,15 @@ impl Body {
             ..
         } = {
             let n_txs = txs.len();
-            let leaves: Vec<_> = txs
-                .iter()
+            
+            // PARALLEL LEAF CONSTRUCTION 🚀
+            // Pre-allocate Vec for direct indexing by parallel threads
+            let mut leaves = vec![CbmtNode::default(); n_txs];
+            
+            // Use Rayon to compute leaves in parallel across all CPU cores
+            use rayon::prelude::*;
+            let results: Result<Vec<_>, ComputeMerkleRootError> = txs
+                .par_iter()
                 .enumerate()
                 .map(|(idx, tx)| {
                     let fees = tx.get_fee().map_err(|err| {
@@ -673,15 +681,22 @@ impl Body {
                         canonical_size,
                         tx: &tx.transaction,
                     };
-                    Ok::<_, ComputeMerkleRootError>(CbmtNode {
-                        commitment: hashes::hash(&leaf_pre_commitment),
+                    let node = CbmtNode {
+                        commitment: hashes::hash_with_scratch_buffer(&leaf_pre_commitment),
                         fees,
                         canonical_size,
                         // see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
                         index: (idx + n_txs) - 1,
-                    })
+                    };
+                    Ok((idx, node))
                 })
-                .collect::<Result<_, _>>()?;
+                .collect();
+            
+            // Fill the pre-allocated vector with computed nodes
+            for (idx, node) in results? {
+                leaves[idx] = node;
+            }
+            
             CbmtWithFeeTotal::build_merkle_root(leaves.as_slice())
         };
         // FIXME: Compute actual merkle root instead of just a hash.
