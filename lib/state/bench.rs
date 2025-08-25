@@ -527,14 +527,15 @@ impl Setup {
             use heed::EnvFlags;
             let mut env_open_opts = heed::EnvOpenOptions::new();
             env_open_opts
-                .map_size(128 * 1024 * 1024 * 1024) // 128 GB
-                .max_dbs(State::NUM_DBS);
+                .map_size(256 * 1024 * 1024 * 1024) // 256 GB for 960MB blocks
+                .max_dbs(State::NUM_DBS)
+                .max_readers(16); // Allow up to 16 concurrent readers
             let fast_flags = EnvFlags::WRITE_MAP
                 | EnvFlags::MAP_ASYNC
                 | EnvFlags::NO_SYNC
                 | EnvFlags::NO_META_SYNC
-                | EnvFlags::NO_READ_AHEAD
-                | EnvFlags::NO_TLS;
+                | EnvFlags::NO_READ_AHEAD;
+                // Removed NO_TLS to enable thread-safe read transactions
             unsafe { env_open_opts.flags(fast_flags) };
             unsafe { Env::open(&env_open_opts, &env_path) }
                 .map_err(EnvError::from)?
@@ -647,11 +648,12 @@ fn connect_blocks(
             blocks.push(block);
         }
         let start = std::time::Instant::now();
+
+        // Process blocks sequentially (each block depends on previous block's tip update)
+        // The parallelization benefit comes from WITHIN each block's UTXO lookups
         let mut rwtxn = setup.env.write_txn()?;
         for block in &blocks {
-            setup
-                .state
-                .apply_block(&mut rwtxn, &block.header, &block.body)?;
+            setup.state.apply_block(&mut rwtxn, &block.header, &block.body)?;
         }
         rwtxn.commit()?;
         res += start.elapsed();
@@ -665,14 +667,23 @@ const SEED_PREIMAGE: &[u8] = b"connect-blocks-benchmark-2025-08-19";
 
 /// Number of blocks to process per LMDB transaction.
 /// Batching blocks reduces commit overhead and amortizes B+tree rebalancing.
-/// Higher values improve throughput but increase memory usage and crash recovery time.
-/// Hardcoded to 10 for the specific benchmark, but should be adjusted.
-const BATCH_SIZE: u32 = 10;
+/// For Contest 4 (960MB blocks), reduced from 10 to 5 to optimize memory usage:
+/// - 960MB × 5 = 4.8GB per batch (vs 9.6GB with BATCH_SIZE=10)
+/// - Better memory utilization for parallel prevalidation across 8 cores
+/// - Reduces memory pressure on 32GB ubuntu-latest-large runner
+const BATCH_SIZE: u32 = 5;
 
 pub fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("connect_blocks", |b| {
         use rand::SeedableRng as _;
         let mut rng = rand_chacha::ChaCha20Rng::from_seed(hash(SEED_PREIMAGE));
+
+        // Configure Rayon thread pool for optimal parallel database reads
+        // ubuntu-latest-large has 8 cores, 32GB RAM
+        let _unused = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .stack_size(8 * 1024 * 1024) // 8MB stack per thread for large UTXO operations
+            .build_global(); // Ignore error if already initialized
         #[cfg(all(
             target_arch = "x86_64",
             target_os = "linux",
