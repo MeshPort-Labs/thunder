@@ -659,7 +659,6 @@ impl Body {
         } = {
             let n_txs = txs.len();
             
-            // PARALLEL LEAF CONSTRUCTION 🚀
             // Pre-allocate Vec for direct indexing by parallel threads
             let mut leaves = vec![CbmtNode::default(); n_txs];
             
@@ -697,13 +696,65 @@ impl Body {
                 leaves[idx] = node;
             }
             
-            CbmtWithFeeTotal::build_merkle_root(leaves.as_slice())
+            // Replace tree-based CBMT with parallel levelized approach for better performance
+            if n_txs >= 1000 {
+                // Use optimized parallel level merging for large transaction sets
+                Self::compute_merkle_root_levelized_parallel(leaves)
+            } else {
+                // Use original CBMT for smaller sets
+                CbmtWithFeeTotal::build_merkle_root(leaves.as_slice())
+            }
         };
         // FIXME: Compute actual merkle root instead of just a hash.
         let coinbase_root = hashes::hash(&coinbase);
         // TODO: Should this include `total_fees`?
         let root = hashes::hash(&(coinbase_root, txs_root)).into();
         Ok(root)
+    }
+
+    /// Optimized level-by-level parallel merkle tree construction
+    /// Processes each level of the tree in parallel for maximum performance
+    fn compute_merkle_root_levelized_parallel(mut current_level: Vec<CbmtNode>) -> CbmtNode {
+        use rayon::prelude::*;
+        
+        while current_level.len() > 1 {
+            // Handle odd number of nodes by duplicating the last node (standard merkle tree approach)
+            if current_level.len() % 2 == 1 {
+                let last_node = current_level.last().unwrap().clone();
+                current_level.push(last_node);
+            }
+            
+            // Process pairs of nodes in parallel across all CPU cores
+            current_level = current_level
+                .par_chunks_exact(2)
+                .enumerate()
+                .map(|(parent_idx, pair)| {
+                    let lnode = &pair[0];
+                    let rnode = &pair[1];
+                    
+                    // Compute parent node using the same merge logic as MergeFeeSizeTotal
+                    let fees = lnode.fees + rnode.fees;
+                    let canonical_size = lnode.canonical_size + rnode.canonical_size;
+                    
+                    let commitment = hashes::hash_with_scratch_buffer(&CbmtNodePreCommitment {
+                        left_commitment: lnode.commitment,
+                        fees,
+                        canonical_size,
+                        right_commitment: rnode.commitment,
+                    });
+                    
+                    CbmtNode {
+                        commitment,
+                        fees,
+                        canonical_size,
+                        index: parent_idx,
+                    }
+                })
+                .collect();
+        }
+        
+        // Return the root node
+        current_level.into_iter().next().expect("Tree should have exactly one root")
     }
 
     #[cfg(feature = "utreexo")]
